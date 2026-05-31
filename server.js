@@ -517,7 +517,4 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "dashboard", "index
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`[Lunex] Server running on port ${PORT}`);
-    // Spawn Discord bot in same process
-    try { require("./bot.js"); console.log("[Lunex] Bot started"); }
-    catch(e) { console.error("[Lunex] Bot failed to start:", e.message); }
 });
