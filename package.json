@@ -1,11 +1,9 @@
 {
-  "name": "dragon-whitelist-service",
+  "name": "lunex-whitelist",
   "version": "1.0.0",
-  "description": "Dragon Whitelist Service",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "bot": "node bot.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
