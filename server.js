@@ -19,17 +19,6 @@ app.use(express.static(path.join(__dirname, "dashboard")));
 const authLimiter = rateLimit({ windowMs: 60_000, max: 60,  message: { error: "Rate limited" }, standardHeaders: true, legacyHeaders: false });
 const apiLimiter  = rateLimit({ windowMs: 60_000, max: 300, message: { error: "Rate limited" }, standardHeaders: true, legacyHeaders: false });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROMETHEUS OBFUSCATION — real Prometheus engine via wasmoon (Lua WASM)
-// Uses the actual Prometheus pipeline: Vmify + EncryptStrings + ConstantArray
-// + NumbersToExpressions + AntiTamper + WrapInFunction (Strong preset)
-// ═══════════════════════════════════════════════════════════════════════════════
-const PrometheusObf = require("./obfuscate.js");
-
-async function obfuscateSource(source, level = "full") {
-    return await PrometheusObf.obfuscate(source, level);
-}
-
 // ── Generators ────────────────────────────────────────────────────────────────
 function genKey(prefix = "LUNEX") {
     const seg = () => crypto.randomBytes(3).toString("hex").toUpperCase();
@@ -166,39 +155,16 @@ app.post("/v1/projects/:id/script", apiLimiter, requireApiKey, wrap(async (req, 
     if (!source?.trim()) return res.status(400).json({ error: "Source required" });
     const { data: proj } = await sb.from("projects").select("*").eq("id", req.params.id).eq("owner_id", req.owner.id).single();
     if (!proj) return res.status(404).json({ error: "Project not found" });
-    const obfLimits = { starter: 30, pro: 200, elite: 9999 };
-    const lim = obfLimits[req.owner.plan] || 30;
-    if ((req.owner.obfs_used || 0) >= lim)
-        return res.status(429).json({ error: `Obfuscation limit reached (${lim}/month)` });
-
-    // Try to obfuscate — fall back to raw source if it fails so script still works
-    let obfuscated = source;
-    let obfError = null;
-    try {
-        obfuscated = await obfuscateSource(source, level);
-    } catch(e) {
-        obfError = e.message;
-        console.error("[Obf] Failed, using raw source:", e.message);
-        // Still store raw — user can re-upload when fixed
-    }
-
     const newVer = String(parseInt(proj.script_version || "0000") + 1).padStart(4, "0");
     await sb.from("projects").update({
-        obfuscated_script: obfuscated,
+        obfuscated_script: source,
         raw_script: source,
         script_version: newVer,
         updated_at: new Date().toISOString()
     }).eq("id", proj.id);
-    await sb.from("owners").update({ obfs_used: (req.owner.obfs_used || 0) + 1 }).eq("id", req.owner.id);
     const base = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${process.env.PORT || 8080}`;
     const loader = `script_key="KEY_HERE"\nloadstring(game:HttpGet("${base}/v1/auth?key="..script_key.."&hwid="..game:GetService("RbxAnalyticsService"):GetClientId()))()`;
-    res.json({
-        success: true,
-        version: newVer,
-        loader,
-        obfuscated: !obfError,
-        warning: obfError ? `Obfuscation failed (raw script stored): ${obfError}` : null
-    });
+    res.json({ success: true, version: newVer, loader });
 }));
 
 app.post("/v1/projects/:id/toggle", apiLimiter, requireApiKey, wrap(async (req, res) => {
