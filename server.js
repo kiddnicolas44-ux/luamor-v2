@@ -513,7 +513,13 @@ cron.schedule("0 0 1 * *", async () => {
     console.log("[CRON] Obfuscation counters reset");
 });
 
-app.get("/", (req, res) => res.sendFile(path.join(__dirname, "dashboard", "index.html")));
+// Serve dashboard for all non-API routes
+app.get("/", (req, res) => {
+    const fp = path.join(__dirname, "dashboard", "index.html");
+    res.sendFile(fp, err => {
+        if (err) res.status(404).send("Dashboard not found. Make sure dashboard/index.html exists.");
+    });
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
