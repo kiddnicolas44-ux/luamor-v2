@@ -170,7 +170,18 @@ app.post("/v1/projects/:id/script", apiLimiter, requireApiKey, wrap(async (req, 
     const lim = obfLimits[req.owner.plan] || 30;
     if ((req.owner.obfs_used || 0) >= lim)
         return res.status(429).json({ error: `Obfuscation limit reached (${lim}/month)` });
-    const obfuscated = await obfuscateSource(source, level);
+
+    // Try to obfuscate — fall back to raw source if it fails so script still works
+    let obfuscated = source;
+    let obfError = null;
+    try {
+        obfuscated = await obfuscateSource(source, level);
+    } catch(e) {
+        obfError = e.message;
+        console.error("[Obf] Failed, using raw source:", e.message);
+        // Still store raw — user can re-upload when fixed
+    }
+
     const newVer = String(parseInt(proj.script_version || "0000") + 1).padStart(4, "0");
     await sb.from("projects").update({
         obfuscated_script: obfuscated,
@@ -181,7 +192,13 @@ app.post("/v1/projects/:id/script", apiLimiter, requireApiKey, wrap(async (req, 
     await sb.from("owners").update({ obfs_used: (req.owner.obfs_used || 0) + 1 }).eq("id", req.owner.id);
     const base = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${process.env.PORT || 8080}`;
     const loader = `script_key="KEY_HERE"\nloadstring(game:HttpGet("${base}/v1/auth?key="..script_key.."&hwid="..game:GetService("RbxAnalyticsService"):GetClientId()))()`;
-    res.json({ success: true, version: newVer, loader });
+    res.json({
+        success: true,
+        version: newVer,
+        loader,
+        obfuscated: !obfError,
+        warning: obfError ? `Obfuscation failed (raw script stored): ${obfError}` : null
+    });
 }));
 
 app.post("/v1/projects/:id/toggle", apiLimiter, requireApiKey, wrap(async (req, res) => {
