@@ -20,173 +20,15 @@ const authLimiter = rateLimit({ windowMs: 60_000, max: 60,  message: { error: "R
 const apiLimiter  = rateLimit({ windowMs: 60_000, max: 300, message: { error: "Rate limited" }, standardHeaders: true, legacyHeaders: false });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LURAPH-LEVEL OBFUSCATION ENGINE
-// Multi-layer: VM bytecode simulation, string encryption, control flow
-// flattening, dead code injection, identifier mutation, XOR+AES-like wrapping
+// PROMETHEUS OBFUSCATION — real Prometheus engine via wasmoon (Lua WASM)
+// Uses the actual Prometheus pipeline: Vmify + EncryptStrings + ConstantArray
+// + NumbersToExpressions + AntiTamper + WrapInFunction (Strong preset)
 // ═══════════════════════════════════════════════════════════════════════════════
-const LuraphObf = (() => {
-    const uid  = () => "_" + crypto.randomBytes(6).toString("hex");
-    const uid2 = () => "V" + crypto.randomBytes(4).toString("hex").toUpperCase();
+const PrometheusObf = require("./obfuscate.js");
 
-    // Layer 1: Encrypt string to byte array with rolling XOR key
-    function encodeStr(s) {
-        if (!s || s.length === 0) return '""';
-        if (s.length > 120) return JSON.stringify(s);
-        const key = Math.floor(Math.random() * 200) + 10;
-        const bytes = Array.from(Buffer.from(s, "utf8")).map((b, i) => ((b ^ (key + i)) & 0xFF).toString());
-        const fn = uid(), r = uid(), i = uid(), S = uid(), K = uid();
-        return `(function() local ${S}={${bytes.join(",")}} local ${K}=${key} local ${r}="" for ${i}=1,#${S} do ${r}=${r}..string.char(bit32.bxor(${S}[${i}],(${K}+${i}-1)%256)) end return ${r} end)()`;
-    }
-
-    // Layer 2: Encode number as complex bit32 expression
-    function encodeNum(n) {
-        if (!Number.isInteger(n) || Math.abs(n) > 0x7FFFFFFF) return String(n);
-        if (n === 0) return "bit32.band(0,0)";
-        const a = (Math.floor(Math.random() * 0xFFFF) + 1);
-        const b = n ^ a;
-        const c = Math.floor(Math.random() * 100) + 1;
-        return `bit32.bxor(${b},bit32.band(${a + c},${0xFFFF})-${c})`;
-    }
-
-    // Layer 3: Generate convincing dead code
-    function junk() {
-        const v = uid(), w = uid(), x = uid();
-        const variants = [
-            `do local ${v}=math.type and math.type(0) or "integer" if ${v}=="float" then error("fatal") end end`,
-            `do local ${v}={} local ${w}=setmetatable(${v},{__index=function() return false end}) if ${w}.x then error() end end`,
-            `do local ${v}=string.byte("A") local ${w}=string.byte("A") if ${v}~=${w} then error() end end`,
-            `do local ${v}=type(nil)=="nil" if not ${v} then error() end end`,
-            `do local ${v}=math.floor(math.pi) if ${v}~=3 then error() end end`,
-            `do local ${v}=({...}) if #${v}>999 then error() end end`,
-            `do local ${v}=tostring(true) if ${v}~="true" then error() end end`,
-            `do local ${v}=string.len("") if ${v}>0 then error() end end`,
-        ];
-        return variants[Math.floor(Math.random() * variants.length)];
-    }
-
-    // Layer 4: Rename all local variables
-    function renameVars(src) {
-        const map = {};
-        const skip = new Set(["_G","_ENV","game","workspace","script","shared","plugin","math","table","string","os","io","bit32","utf8","coroutine","debug","package","loadstring","require","pairs","ipairs","next","select","type","error","assert","pcall","xpcall","tostring","tonumber","rawget","rawset","rawequal","rawlen","setmetatable","getmetatable","unpack","print","warn","task","wait","tick","time","delay","spawn","coroutine","Instance","Vector3","Vector2","CFrame","Color3","UDim","UDim2","Enum","game","workspace","Players","RunService","TweenService","UserInputService","HttpService","TeleportService"]);
-        src = src.replace(/\blocal\s+([a-zA-Z][a-zA-Z0-9_]{1,})\s*=/g, (m, name) => {
-            if (skip.has(name)) return m;
-            if (!map[name]) map[name] = uid();
-            return `local ${map[name]} =`;
-        });
-        for (const [orig, renamed] of Object.entries(map)) {
-            src = src.replace(new RegExp(`\\b${orig}\\b`, "g"), renamed);
-        }
-        return src;
-    }
-
-    // Layer 5: Obfuscate string literals
-    function obfStrings(src) {
-        return src.replace(/"((?:[^"\\]|\\.)*)"/g, (m, inner) => {
-            if (inner.length < 2 || inner.length > 100) return m;
-            if (/[\\n\\r\\t]/.test(inner)) return m;
-            if (inner.includes("\\")) return m;
-            if (Math.random() < 0.25) return m;
-            try { return encodeStr(inner); } catch { return m; }
-        });
-    }
-
-    // Layer 6: Obfuscate numbers
-    function obfNumbers(src) {
-        return src.replace(/\b(\d+)\b/g, (m, n) => {
-            const num = parseInt(n);
-            if (num > 100000 || Math.random() < 0.3) return m;
-            return encodeNum(num);
-        });
-    }
-
-    // Layer 7: Insert junk statements
-    function insertJunk(src) {
-        const lines = src.split("\n");
-        const out = [];
-        for (let i = 0; i < lines.length; i++) {
-            out.push(lines[i]);
-            if (i > 0 && i % 8 === 0 && Math.random() > 0.4) out.push(junk());
-        }
-        return out.join("\n");
-    }
-
-    // Layer 8: Control flow flattening via state machine
-    function flattenFlow(src) {
-        const state = uid();
-        const steps = src.split(/\n(?=local |function |for |while |if |do |repeat )/).filter(s => s.trim());
-        if (steps.length < 4) return src;
-        const cases = steps.map((s, i) => `if ${state}==${i} then\n${s}\n${state}=${i+1}`).join("\nelseif ");
-        return `local ${state}=0\nwhile ${state}<${steps.length} do\n${cases}\nend\nend`;
-    }
-
-    // Layer 9: Wrap entire payload in AES-like XOR + base64 + VM bootstrapper
-    function xorWrap(src) {
-        // Multi-key XOR with rotating keys
-        const keys = Array.from(crypto.randomBytes(32));
-        const srcBuf = Buffer.from(src, "utf8");
-        const xored = Buffer.alloc(srcBuf.length);
-        for (let i = 0; i < srcBuf.length; i++) {
-            xored[i] = srcBuf[i] ^ keys[i % keys.length] ^ (i & 0xFF);
-        }
-        const b64 = xored.toString("base64");
-        const kStr = `{${keys.join(",")}}`;
-        // Split base64 into chunks to avoid long line issues
-        const chunks = [];
-        for (let i = 0; i < b64.length; i += 80) chunks.push(`"${b64.slice(i,i+80)}"`);
-        const chunkStr = `{${chunks.join(",")}}`;
-
-        const S=uid(),r=uid(),o=uid(),i2=uid(),b=uid(),c=uid(),d=uid(),m=uid(),j=uid(),K=uid(),n=uid();
-        return `-- Lunex Protected [v2] --
-local ${b}="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local ${m}={} for ${i2}=1,#${b} do ${m}[${b}:sub(${i2},${i2})]=${i2}-1 end
-local function ${d}(${S})
-  ${S}=${S}:gsub("[^A-Za-z0-9+/=]","") local ${o}={}
-  for ${i2}=1,#${S},4 do
-    local ${c}={${m}[${S}:sub(${i2},${i2})]or 0,${m}[${S}:sub(${i2}+1,${i2}+1)]or 0,${m}[${S}:sub(${i2}+2,${i2}+2)]or 0,${m}[${S}:sub(${i2}+3,${i2}+3)]or 0}
-    local ${r}=${c}[1]*262144+${c}[2]*4096+${c}[3]*64+${c}[4]
-    ${o}[#${o}+1]=string.char(math.floor(${r}/65536)%256)
-    if ${S}:sub(${i2}+2,${i2}+2)~="=" then ${o}[#${o}+1]=string.char(math.floor(${r}/256)%256) end
-    if ${S}:sub(${i2}+3,${i2}+3)~="=" then ${o}[#${o}+1]=string.char(${r}%256) end
-  end
-  return table.concat(${o})
-end
-local ${K}=${kStr}
-local ${j}=${chunkStr}
-local ${S}=${d}(table.concat(${j})) local ${o}={}
-for ${i2}=1,#${S} do
-  ${o}[${i2}]=string.char(bit32.bxor(string.byte(${S},${i2}),${K}[((${i2}-1)%#${K})+1],bit32.band(${i2}-1,255)))
-end
-local ${n}=table.concat(${o})
-local ${r},${c}=loadstring(${n})
-if not ${r} then error("Lunex: corrupt payload - "..tostring(${c})) end
-${r}()`;
-    }
-
-    return function obfuscate(source, level = "full") {
-        let s = source;
-        try {
-            if (level === "light") {
-                s = obfStrings(s);
-                s = insertJunk(s);
-                s = xorWrap(s);
-                return s;
-            }
-            // Full Luraph-level pipeline
-            s = renameVars(s);
-            s = obfStrings(s);
-            s = obfNumbers(s);
-            s = insertJunk(s);
-            s = flattenFlow(s);
-            s = insertJunk(s);  // second pass after flatten
-            s = xorWrap(s);
-            return s;
-        } catch(e) {
-            // Fallback to XOR wrap only if pipeline fails
-            console.error("[Obf] Pipeline error, using fallback:", e.message);
-            return xorWrap(source);
-        }
-    };
-})();
+async function obfuscateSource(source, level = "full") {
+    return await PrometheusObf.obfuscate(source, level);
+}
 
 // ── Generators ────────────────────────────────────────────────────────────────
 function genKey(prefix = "LUNEX") {
@@ -328,7 +170,7 @@ app.post("/v1/projects/:id/script", apiLimiter, requireApiKey, wrap(async (req, 
     const lim = obfLimits[req.owner.plan] || 30;
     if ((req.owner.obfs_used || 0) >= lim)
         return res.status(429).json({ error: `Obfuscation limit reached (${lim}/month)` });
-    const obfuscated = LuraphObf(source, level);
+    const obfuscated = await obfuscateSource(source, level);
     const newVer = String(parseInt(proj.script_version || "0000") + 1).padStart(4, "0");
     await sb.from("projects").update({
         obfuscated_script: obfuscated,
