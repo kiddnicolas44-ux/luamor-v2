@@ -576,6 +576,11 @@ app.post("/v1/coupons/validate", apiL, wrap(async(req,res)=>{
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVE DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
+app.get("/home",(req,res)=>{
+    res.sendFile(path.join(__dirname,"dashboard","home.html"),err=>{
+        if(err) res.redirect("/");
+    });
+});
 app.get("/pricing",(req,res)=>{
     res.sendFile(path.join(__dirname,"dashboard","pricing.html"),err=>{
         if(err) res.sendFile(path.join(__dirname,"dashboard","index.html"),()=>{});
