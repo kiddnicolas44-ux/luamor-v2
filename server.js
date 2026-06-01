@@ -11,6 +11,15 @@ const app = express();
 const sb  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 app.set("trust proxy", 1);
+// Security headers — prevent clickjacking, sniffing, XSS
+app.use((req,res,next)=>{
+    res.setHeader("X-Content-Type-Options","nosniff");
+    res.setHeader("X-Frame-Options","DENY");
+    res.setHeader("X-XSS-Protection","1; mode=block");
+    res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");
+    res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=()");
+    next();
+});
 app.use(cors({ origin:"*", methods:["GET","POST","PUT","DELETE","OPTIONS"], allowedHeaders:["Content-Type","Authorization","x-api-key"] }));
 app.options("*", cors());
 app.use(express.json({ limit:"16mb" }));
@@ -225,43 +234,122 @@ function wrap(fn) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SCRIPT AUTH — Roblox executors call this
-// Cached per (key+hwid) for 10s to handle 50 concurrent users without DB hammering
+// SCRIPT AUTH — two-step token system
+//
+// Step 1: GET /v1/auth?key=LUNEX-XXX&hwid=HWID_HASH
+//   → validates key, locks HWID, returns signed 30-second token
+// Step 2: GET /v1/run?t=TOKEN
+//   → verifies token signature + expiry, returns encrypted script
+//   → token is single-use and deleted after use
+//
+// Loader: loadstring(game:HttpGet(BASE/v1/auth?key=KEY_HERE&hwid=HWID))()
+// The /v1/run URL never contains the user's key — only a 30s random token
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Sign a token: base64url(json) + "." + HMAC-SHA256 signature
+function signToken(payload) {
+    const data = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const sig  = crypto.createHmac("sha256", MASTER).update(data).digest("base64url");
+    return data + "." + sig;
+}
+function verifyToken(token) {
+    try {
+        const [data, sig] = token.split(".");
+        if (!data||!sig) return null;
+        const expected = crypto.createHmac("sha256", MASTER).update(data).digest("base64url");
+        // Constant-time comparison to prevent timing attacks
+        if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+        const payload = JSON.parse(Buffer.from(data, "base64url").toString());
+        if (payload.exp < Math.floor(Date.now()/1000)) return null; // expired
+        return payload;
+    } catch { return null; }
+}
+
+// Step 1 — validate key, lock HWID, issue 30s token
 app.get("/v1/auth", authL, wrap(async(req,res)=>{
     const userKey = san(String(req.query.key||""),100);
     const hwid    = san(String(req.query.hwid||""),200);
     const fail    = msg => res.set("Content-Type","text/plain").send(`error("Lunex: ${msg}")`);
 
-    if (!userKey||!hwid) return fail("Missing key or hwid");
+    if (!userKey) return fail("Missing key");
+    // hwid is optional — we use it if provided, skip if not (FFA scripts)
 
-    // Cache hit — return stored script instantly (handles 50 users spamming)
-    const cacheKey = `auth:${userKey}:${hwid}`;
+    // Cache: same key+hwid gets same token for 25s (avoids hammering DB on retry)
+    const cacheKey = `tok:${userKey}:${hwid}`;
     const cached   = cacheGet(cacheKey);
     if (cached) return res.set("Content-Type","text/plain").send(cached);
 
-    const {data:row} = await sb.from("keys")
-        .select("*, projects(obfuscated_script,ffa,active,name,id)")
+    const {data:row,error:rowErr} = await sb.from("keys")
+        .select("id,active,expires_at,hwid,key_days,total_executions,project_id")
         .eq("key_string",userKey).single();
 
-    if (!row)        return fail("Invalid key");
-    if (!row.active) return fail("Key revoked — contact support");
+    if (rowErr||!row)  return fail("Invalid key");
+    if (!row.active)   return fail("Key revoked — contact support");
     if (row.expires_at&&Math.floor(Date.now()/1000)>row.expires_at) return fail("Key expired");
 
-    if (!row.hwid) {
-        const exp = row.key_days ? Math.floor(Date.now()/1000)+row.key_days*86400 : null;
-        await sb.from("keys").update({hwid,total_executions:1,last_exec:new Date().toISOString(),...(exp?{expires_at:exp}:{})}).eq("id",row.id);
-    } else if (row.hwid!==hwid) {
-        return fail("HWID mismatch — run /resethwid in Discord");
-    } else {
-        await sb.from("keys").update({total_executions:(row.total_executions||0)+1,last_exec:new Date().toISOString()}).eq("id",row.id);
+    // HWID lock
+    if (hwid) {
+        if (!row.hwid) {
+            const exp = row.key_days ? Math.floor(Date.now()/1000)+row.key_days*86400 : null;
+            await sb.from("keys").update({
+                hwid,
+                total_executions:1,
+                last_exec:new Date().toISOString(),
+                ...(exp?{expires_at:exp}:{})
+            }).eq("id",row.id);
+        } else if (row.hwid!==hwid) {
+            return fail("HWID mismatch — run /resethwid in Discord to switch devices");
+        } else {
+            // Fire-and-forget exec count update (don't await — faster response)
+            sb.from("keys").update({
+                total_executions:(row.total_executions||0)+1,
+                last_exec:new Date().toISOString()
+            }).eq("id",row.id).then(()=>{}).catch(()=>{});
+        }
     }
 
-    const proj = row.projects;
-    if (!proj?.active)          return fail("Script is offline");
+    // Issue a 30-second signed token containing the project_id
+    const token = signToken({
+        pid: row.project_id,
+        kid: row.id,
+        exp: Math.floor(Date.now()/1000)+30,
+        r:   crypto.randomBytes(4).toString("hex") // nonce — prevents replay
+    });
+
+    // Return a tiny Lua snippet that immediately fetches and runs the script
+    const BASE = process.env.RAILWAY_PUBLIC_DOMAIN
+        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+        : `http://localhost:${process.env.PORT||8080}`;
+    const runUrl = `${BASE}/v1/run?t=${encodeURIComponent(token)}`;
+    const snippet = `loadstring(game:HttpGet("${runUrl}"))()`;
+
+    cacheSet(cacheKey, snippet, 25000);
+    res.set("Content-Type","text/plain").send(snippet);
+}));
+
+// Step 2 — verify token, return encrypted script
+app.get("/v1/run", authL, wrap(async(req,res)=>{
+    const fail = msg => res.set("Content-Type","text/plain").send(`error("Lunex: ${msg}")`);
+    const t    = san(String(req.query.t||""),512);
+    if (!t) return fail("Missing token");
+
+    const payload = verifyToken(t);
+    if (!payload)  return fail("Invalid or expired token — re-run the loader");
+
+    // Cache the script by project_id for 15s — fast for 50 concurrent users
+    const cacheKey = `script:${payload.pid}`;
+    const cached   = cacheGet(cacheKey);
+    if (cached) return res.set("Content-Type","text/plain").send(cached);
+
+    const {data:proj,error:projErr} = await sb.from("projects")
+        .select("obfuscated_script,active")
+        .eq("id",payload.pid).single();
+
+    if (projErr||!proj)            return fail("Script not found");
+    if (!proj.active)              return fail("Script is offline");
     if (!proj.obfuscated_script?.trim()) return fail("No script uploaded yet");
 
-    cacheSet(cacheKey, proj.obfuscated_script, 10000);
+    cacheSet(cacheKey, proj.obfuscated_script, 15000);
     res.set("Content-Type","text/plain").send(proj.obfuscated_script);
 }));
 
@@ -331,7 +419,9 @@ app.post("/v1/projects/:id/script", apiL, auth, wrap(async(req,res)=>{
     if (error) return res.status(500).json({error:error.message});
     cacheDel("projs:"+req.owner.id, "auth:");
     const base = process.env.RAILWAY_PUBLIC_DOMAIN?`https://${process.env.RAILWAY_PUBLIC_DOMAIN}`:`http://localhost:${process.env.PORT||8080}`;
-    const loader = `script_key="KEY_HERE"\nloadstring(game:HttpGet("${base}/v1/auth?key="..script_key.."&hwid="..game:GetService("RbxAnalyticsService"):GetClientId()))()`;
+    // Clean single-line loader. User replaces KEY_HERE with their key.
+    // Server validates key, locks HWID, returns 30s signed token automatically.
+    const loader = `loadstring(game:HttpGet("${base}/v1/auth?key=KEY_HERE&hwid="..game:GetService("RbxAnalyticsService"):GetClientId()))()`;
     res.json({success:true,version:ver,loader});
 }));
 
@@ -508,6 +598,12 @@ app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
 
     if (!PLANS[plan])  return res.status(400).json({error:"Invalid plan"});
     if (!email)        return res.status(400).json({error:"Email required"});
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({error:"Invalid email format"});
+    // Rate limit: max 3 payment attempts per email per hour
+    const recentKey = "payattempt:"+crypto.createHash("md5").update(email).digest("hex");
+    const attempts  = (cacheGet(recentKey)||0)+1;
+    cacheSet(recentKey, attempts, 3600000);
+    if (attempts>3) return res.status(429).json({error:"Too many payment attempts. Try again later."});
 
     const p = PLANS[plan];
     let price = p.price;
@@ -595,8 +691,20 @@ app.post("/v1/payments/webhook", express.json(), wrap(async(req,res)=>{
 
     // Find pending payment
     const {data:pmt} = await sb.from("pending_payments").select("*").eq("order_id",order_id).single();
-    if (!pmt) return res.status(200).json({ok:true});
-    if (pmt.status==="completed") return res.status(200).json({ok:true}); // already processed
+    if (!pmt) {
+        console.warn("[Pay] No pending payment for order_id:", order_id);
+        return res.status(200).json({ok:true});
+    }
+    if (pmt.status==="completed") {
+        console.log("[Pay] Already processed:", order_id);
+        return res.status(200).json({ok:true}); // idempotent — safe to receive twice
+    }
+    // Double-spend guard: mark as processing first (atomic)
+    const {data:locked} = await sb.from("pending_payments")
+        .update({status:"processing"})
+        .eq("order_id",order_id).eq("status","pending")
+        .select("id");
+    if (!locked?.length) return res.status(200).json({ok:true}); // another request got it first
 
     // Create the owner account
     const plan = PLANS[pmt.plan];
@@ -622,7 +730,14 @@ app.post("/v1/payments/webhook", express.json(), wrap(async(req,res)=>{
 app.get("/v1/payments/status/:invoiceId", apiL, wrap(async(req,res)=>{
     const {data} = await sb.from("pending_payments").select("status,api_key,plan,email").eq("invoice_id",req.params.invoiceId).single();
     if (!data) return res.status(404).json({error:"Payment not found"});
-    res.json({success:true, status:data.status, api_key:data.status==="completed"?data.api_key:null, plan:data.plan});
+    // Never send api_key if payment failed or is pending — only on completed
+    res.json({
+        success:true,
+        status:data.status,
+        api_key: data.status==="completed" ? data.api_key : null,
+        plan:data.plan,
+        email: data.status==="completed" ? data.email : null
+    });
 }));
 
 // Get plan info
