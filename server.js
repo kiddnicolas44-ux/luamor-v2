@@ -576,26 +576,21 @@ app.post("/v1/coupons/validate", apiL, wrap(async(req,res)=>{
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVE DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/home",(req,res)=>{
-    res.sendFile(path.join(__dirname,"dashboard","home.html"),err=>{
-        if(err) res.redirect("/");
-    });
+// Route table — clean and intentional
+// /          → homepage (home.html)
+// /login     → dashboard (index.html)
+// /pricing   → pricing page
+// /payment-success → payment confirmation
+const sf = (file,res) => res.sendFile(path.join(__dirname,"dashboard",file), err=>{
+    if(err) res.status(404).send("Page not found");
 });
-app.get("/pricing",(req,res)=>{
-    res.sendFile(path.join(__dirname,"dashboard","pricing.html"),err=>{
-        if(err) res.sendFile(path.join(__dirname,"dashboard","index.html"),()=>{});
-    });
-});
-app.get("/payment-success",(req,res)=>{
-    res.sendFile(path.join(__dirname,"dashboard","payment-success.html"),err=>{
-        if(err) res.sendFile(path.join(__dirname,"dashboard","index.html"),()=>{});
-    });
-});
-app.get("/",(req,res)=>{
-    res.sendFile(path.join(__dirname,"dashboard","index.html"),err=>{
-        if(err)res.status(500).send("Dashboard not found — ensure dashboard/index.html exists.");
-    });
-});
+
+app.get("/",            (req,res)=>sf("home.html",res));
+app.get("/home",        (req,res)=>sf("home.html",res));
+app.get("/login",       (req,res)=>sf("index.html",res));
+app.get("/dashboard",   (req,res)=>sf("index.html",res));
+app.get("/pricing",     (req,res)=>sf("pricing.html",res));
+app.get("/payment-success",(req,res)=>sf("payment-success.html",res));
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
 
 process.on("uncaughtException", e=>console.error("[UNCAUGHT]",e.message));
