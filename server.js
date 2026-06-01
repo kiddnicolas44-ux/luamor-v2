@@ -14,7 +14,8 @@ app.set("trust proxy", 1);
 app.use(cors({ origin:"*", methods:["GET","POST","PUT","DELETE","OPTIONS"], allowedHeaders:["Content-Type","Authorization","x-api-key"] }));
 app.options("*", cors());
 app.use(express.json({ limit:"16mb" }));
-app.use(express.static(path.join(__dirname,"dashboard"), { maxAge:"1h" }));
+// Static files served only for assets, NOT index.html (routes handle pages)
+app.use("/assets", express.static(path.join(__dirname,"dashboard","assets")));
 
 // ── Rate limiters ─────────────────────────────────────────────────────────────
 const lim  = (max) => rateLimit({ windowMs:60_000, max, message:{error:"Rate limited"}, standardHeaders:true, legacyHeaders:false });
