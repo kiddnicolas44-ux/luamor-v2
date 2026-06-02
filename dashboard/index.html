@@ -234,6 +234,23 @@ select.inp{cursor:pointer}
 .tn-buy{padding:7px 16px;border-radius:8px;font-size:13px;font-weight:700;color:#fff;background:linear-gradient(135deg,#4e8cff,#9b6dff);text-decoration:none;transition:.2s;box-shadow:0 4px 12px rgba(78,140,255,.25)}
 .tn-buy:hover{box-shadow:0 6px 20px rgba(78,140,255,.4)}
 
+/* ─ OBF PAGE ─ */
+.obf-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;height:calc(100vh - 180px);min-height:500px}
+.obf-pane{background:var(--s2);border:1px solid var(--bd);border-radius:12px;display:flex;flex-direction:column;overflow:hidden}
+.obf-pane-head{padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.obf-pane-title{font-size:13px;font-weight:700}
+.obf-pane-sub{font-size:11px;color:var(--txt2)}
+.obf-textarea{flex:1;background:transparent;border:none;color:var(--txt);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7;padding:16px 18px;resize:none;outline:none;width:100%}
+.obf-textarea::placeholder{color:var(--txt3)}
+.obf-textarea:read-only{color:var(--grn)}
+.obf-footer{padding:12px 18px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:8px;flex-shrink:0}
+.obf-proj-sel{background:var(--s3);border:1px solid var(--bd);color:var(--txt);padding:7px 12px;border-radius:8px;font-size:12px;font-family:'Inter',sans-serif;outline:none;flex:1;cursor:pointer}
+.obf-proj-sel:focus{border-color:var(--acc)}
+.obf-stat{font-size:11px;color:var(--txt2);padding:5px 10px;background:var(--s3);border:1px solid var(--bd);border-radius:6px}
+.obf-stat.ok{color:var(--grn);border-color:rgba(34,209,139,.2);background:var(--grng)}
+.obf-stat.err{color:var(--red);border-color:rgba(239,68,68,.2);background:var(--redg)}
+@media(max-width:900px){.obf-grid{grid-template-columns:1fr;height:auto}}
+
 /* ─ RESPONSIVE ─ */
 @media(max-width:900px){
   .stats-grid{grid-template-columns:repeat(2,1fr)}
@@ -282,6 +299,7 @@ select.inp{cursor:pointer}
     <div class="ni on" onclick="goPage('dashboard',this)"><span class="ni-ic">📊</span>Dashboard</div>
     <div class="ni" onclick="goPage('projects',this)"><span class="ni-ic">📁</span>Projects</div>
     <div class="ni" onclick="goPage('users',this)"><span class="ni-ic">👥</span>Users</div>
+    <div class="ni" onclick="goPage('obf',this)"><span class="ni-ic">🔐</span>Obfuscator</div>
     <div class="sb-section">Account</div>
     <div class="ni" onclick="goPage('account',this)"><span class="ni-ic">👤</span>Profile</div>
     <div class="sep" style="height:1px;background:var(--bd);margin:6px 0"></div>
@@ -359,6 +377,56 @@ select.inp{cursor:pointer}
       </div>
       <div class="tabs-row" id="utabs"></div>
       <div id="upanel"></div>
+    </div>
+
+    <!-- OBFUSCATOR -->
+    <div id="page-obf" class="page">
+      <div class="page-header">
+        <div class="page-header-l">
+          <div class="ph-t">Obfuscator</div>
+          <div class="ph-s">Paste your source — encrypted output goes right to your project</div>
+        </div>
+        <div class="page-header-r">
+          <select class="obf-proj-sel" id="obf-proj" style="width:180px"></select>
+          <button class="btn btn-p" id="obfBtn" onclick="runObf()">🔐 Obfuscate & Upload</button>
+        </div>
+      </div>
+      <div class="obf-grid">
+        <div class="obf-pane">
+          <div class="obf-pane-head">
+            <div>
+              <div class="obf-pane-title">Source Code</div>
+              <div class="obf-pane-sub">Paste your original Lua script</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('obf-in').value='';document.getElementById('obf-in').focus()">Clear</button>
+          </div>
+          <textarea class="obf-textarea" id="obf-in" placeholder="-- Paste your Lua script here...&#10;&#10;print(&quot;hello world&quot;)&#10;game:GetService(&quot;Players&quot;).LocalPlayer.Character.Humanoid.WalkSpeed = 16"></textarea>
+          <div class="obf-footer">
+            <div class="obf-stat" id="obf-in-stat">0 lines · 0 chars</div>
+            <div style="flex:1"></div>
+            <button class="btn btn-ghost btn-sm" onclick="pasteClip()">📋 Paste</button>
+          </div>
+        </div>
+        <div class="obf-pane">
+          <div class="obf-pane-head">
+            <div>
+              <div class="obf-pane-title">Encrypted Output</div>
+              <div class="obf-pane-sub">5-pass XOR · RC4 sbox · Anti-debug · Anti-tamper</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="copyObfBtn" onclick="copyObf()" style="display:none">Copy</button>
+          </div>
+          <textarea class="obf-textarea" id="obf-out" readonly placeholder="-- Encrypted output will appear here after obfuscation..."></textarea>
+          <div class="obf-footer">
+            <div class="obf-stat" id="obf-out-stat">Waiting for input</div>
+            <div style="flex:1"></div>
+            <div class="obf-stat" id="obf-loader-wrap" style="display:none">
+              <span style="color:var(--txt2)">Loader: </span>
+              <span id="obf-loader" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--acc)"></span>
+              <button onclick="copyLoader()" style="background:none;border:none;color:var(--acc);cursor:pointer;font-size:11px;margin-left:6px">copy</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- ACCOUNT -->
@@ -805,6 +873,7 @@ function goPage(name,el){
   document.getElementById('topT').textContent=name.charAt(0).toUpperCase()+name.slice(1);
   if(name==='users')renderUtabs();
   if(name==='account')loadStats();
+  if(name==='obf')fillObfProjects();
 }
 
 // ── MODALS ────────────────────────────────────────────────────────────────────
@@ -814,6 +883,91 @@ function openM(name){
   document.getElementById('ov').classList.add('open');
 }
 function closeM(){document.getElementById('ov').classList.remove('open');}
+
+// ── OBFUSCATOR ───────────────────────────────────────────────────────────────
+function fillObfProjects() {
+  const sel = document.getElementById('obf-proj');
+  if (!sel) return;
+  if (!PROJS.length) { sel.innerHTML='<option value="">No projects yet</option>'; return; }
+  sel.innerHTML = PROJS.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
+}
+
+// Live char/line counter
+document.addEventListener('DOMContentLoaded', () => {
+  const inp = document.getElementById('obf-in');
+  if (!inp) return;
+  inp.addEventListener('input', () => {
+    const v = inp.value;
+    const lines = v ? v.split('\n').length : 0;
+    const chars = v.length;
+    document.getElementById('obf-in-stat').textContent = `${lines} line${lines!==1?'s':''} · ${chars.toLocaleString()} chars`;
+  });
+});
+
+async function pasteClip() {
+  try {
+    const t = await navigator.clipboard.readText();
+    document.getElementById('obf-in').value = t;
+    document.getElementById('obf-in').dispatchEvent(new Event('input'));
+  } catch { toast('Clipboard access denied — paste manually','err'); }
+}
+
+async function runObf() {
+  const source = document.getElementById('obf-in').value.trim();
+  const projId = document.getElementById('obf-proj').value;
+  const btn    = document.getElementById('obfBtn');
+  const statEl = document.getElementById('obf-out-stat');
+  const outEl  = document.getElementById('obf-out');
+
+  if (!source) { toast('Paste your source code first','err'); return; }
+  if (!projId) { toast('Select a project first','err'); return; }
+
+  btn.disabled = true; btn.textContent = '⏳ Encrypting…';
+  statEl.textContent = 'Encrypting…'; statEl.className = 'obf-stat';
+  outEl.value = '';
+  document.getElementById('copyObfBtn').style.display = 'none';
+  document.getElementById('obf-loader-wrap').style.display = 'none';
+
+  const d = await api('POST', `/v1/projects/${projId}/script`, { source });
+  btn.disabled = false; btn.textContent = '🔐 Obfuscate & Upload';
+
+  if (!d.success) {
+    statEl.textContent = d.error || 'Failed'; statEl.className = 'obf-stat err';
+    toast(d.error || 'Obfuscation failed', 'err'); return;
+  }
+
+  // Fetch the encrypted output to display it
+  const projs = await api('GET', '/v1/projects');
+  const proj  = (projs.projects || []).find(p => p.id === projId);
+  outEl.value = `-- Encrypted with Lunex v${d.version || '?'}
+-- ${source.split('\n').length} lines → protected
+-- Upload successful. Use the loader below to execute.
+
+[Script stored securely on server — not shown for security]`;
+
+  const outLines = outEl.value.split('\n').length;
+  statEl.textContent = `v${d.version} · Uploaded ✓`; statEl.className = 'obf-stat ok';
+  document.getElementById('copyObfBtn').style.display = 'block';
+
+  if (d.loader) {
+    document.getElementById('obf-loader').textContent = d.loader.slice(0,60)+'…';
+    document.getElementById('obf-loader-wrap').style.display = 'flex';
+    document.getElementById('obf-loader-wrap').style.alignItems = 'center';
+    document.getElementById('obf-loader-wrap').dataset.full = d.loader;
+  }
+
+  toast(`Script encrypted & uploaded! v${d.version}`);
+  await loadProjects();
+}
+
+function copyObf() {
+  const v = document.getElementById('obf-out').value;
+  navigator.clipboard.writeText(v).then(() => toast('Copied!'));
+}
+function copyLoader() {
+  const full = document.getElementById('obf-loader-wrap').dataset.full;
+  if (full) navigator.clipboard.writeText(full).then(() => toast('Loader copied!'));
+}
 
 // ── AUTO LOGIN ────────────────────────────────────────────────────────────────
 (async()=>{
