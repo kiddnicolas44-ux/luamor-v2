@@ -936,17 +936,12 @@ async function runObf() {
     toast(d.error || 'Obfuscation failed', 'err'); return;
   }
 
-  // Fetch the encrypted output to display it
-  const projs = await api('GET', '/v1/projects');
-  const proj  = (projs.projects || []).find(p => p.id === projId);
-  outEl.value = `-- Encrypted with Lunex v${d.version || '?'}
--- ${source.split('\n').length} lines → protected
--- Upload successful. Use the loader below to execute.
-
-[Script stored securely on server — not shown for security]`;
-
-  const outLines = outEl.value.split('\n').length;
-  statEl.textContent = `v${d.version} · Uploaded ✓`; statEl.className = 'obf-stat ok';
+  // Fetch and show the full encrypted source
+  const raw = await fetch(BASE+`/v1/projects/${projId}/script-raw`,{
+    headers:{'Authorization':'Bearer '+KEY}
+  }).then(r=>r.text()).catch(()=>'-- fetch error');
+  outEl.value = raw;
+  statEl.textContent = `v${d.version} · ${raw.length.toLocaleString()} chars`; statEl.className = 'obf-stat ok';
   document.getElementById('copyObfBtn').style.display = 'block';
 
   if (d.loader) {
