@@ -6,12 +6,13 @@ const { createClient } = require("@supabase/supabase-js");
 const crypto     = require("crypto");
 const path       = require("path");
 const cron       = require("node-cron");
+const luaparse   = require("luaparse");
 
 const app = express();
 const sb  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 app.set("trust proxy", 1);
-// Security headers — prevent clickjacking, sniffing, XSS
+// Security headers - prevent clickjacking, sniffing, XSS
 app.use((req,res,next)=>{
     res.setHeader("X-Content-Type-Options","nosniff");
     res.setHeader("X-Frame-Options","DENY");
@@ -26,63 +27,251 @@ app.use(express.json({ limit:"16mb" }));
 // Static files served only for assets, NOT index.html (routes handle pages)
 app.use("/assets", express.static(path.join(__dirname,"dashboard","assets")));
 
-// ── Rate limiters ─────────────────────────────────────────────────────────────
+// -- Rate limiters -------------------------------------------------------------
 const lim  = (max) => rateLimit({ windowMs:60_000, max, message:{error:"Rate limited"}, standardHeaders:true, legacyHeaders:false });
 const authL  = lim(60);
 const apiL   = lim(300);
 const adminL = lim(10);
 
-// ── In-memory LRU cache (TTL 30s) for hot paths ───────────────────────────────
+// -- In-memory LRU cache (TTL 30s) for hot paths -------------------------------
 const cache = new Map();
 function cacheGet(k)    { const e=cache.get(k); if(!e)return null; if(Date.now()>e.exp){cache.delete(k);return null;} return e.val; }
 function cacheSet(k,v,ttl=30000) { cache.set(k,{val:v,exp:Date.now()+ttl}); }
 function cacheDel(...ks) { ks.forEach(k=>{ for(const [ck] of cache) if(ck.startsWith(k)) cache.delete(ck); }); }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LURAPH-LEVEL ENCRYPTION ENGINE v2
+// ===============================================================================
+// MULTI-LAYER OBFUSCATION ENGINE
 //
-// Layers (in order):
-// 1. RC4-keyed sbox substitution (project-specific, permanent)
-// 2. 5-pass XOR cipher with random session keys (changes every upload)
-// 3. Anti-tamper: SHA-256 hash of source embedded — wrong on modification
-// 4. Anti-debug: detects debug.getinfo/hookfunction/getupvalues, crashes silently
-// 5. Control flow flattening: dispatch table + state machine wraps the decoder
-// 6. Anti-beautify: invalid escape sequences break formatters
-// 7. All variable names randomised — different every single upload
+// Layer 1 - Source-level (runs on original Lua BEFORE encryption):
+//   - AST parse via luaparse -> full structural understanding
+//   - All string literals XOR-encrypted with unique per-string keys -> byte arrays
+//   - All integer literals -> bit32.bxor(N^K, K) (evaluates to same value)
+//   - All boolean literals -> opaque bit32 expressions
+//   - All local variable/function/param names -> random 13-char hex identifiers
+//   - For-loop variables renamed
+//   - Junk variable declarations injected
+//   Attacker result: even if outer layer is cracked, sees heavily obfuscated Lua
 //
-// Verified: decode order is mathematically correct, 5/5 roundtrip tests pass
-// ═══════════════════════════════════════════════════════════════════════════════
+// Layer 2 - RC4 sbox + 5-pass XOR cipher (per-project key + random session keys)
+//   Attacker result: encrypted bytes, not valid Lua
+//
+// Layer 3 - VM state machine wrapper (6-state dispatch loop)
+//   Attacker result: control flow is flattened even in the wrapper
+//
+// Layer 4 - Anti-tamper byte checksum (wrong on any modification -> infinite loop)
+// Layer 5 - Anti-debug (hookfunction/getupvalues/getgc detection)
+//
+// To reach Luraph's EXACT level would require luac bytecode compilation.
+// This is the strongest source-level obfuscation possible without luac.
+// ===============================================================================
 const MASTER = process.env.MASTER_SECRET || crypto.randomBytes(32).toString("hex");
 
 function deriveKey(pid) {
     return Array.from(crypto.createHash("sha256").update(MASTER+"|"+pid).digest());
 }
-
 function uid() {
-    return "abcdefghijklmnopqrstuvwxyz"[Math.floor(Math.random()*26)] + crypto.randomBytes(5).toString("hex");
+    return "abcdefghijklmnopqrstuvwxyz"[Math.floor(Math.random()*26)] + crypto.randomBytes(6).toString("hex");
 }
 
+// -----------------------------------------------------------------------------
+// LAYER 1: SOURCE-LEVEL OBFUSCATION (AST-based)
+// -----------------------------------------------------------------------------
+function rawToStr(raw) {
+    if (!raw) return "";
+    if (raw.startsWith("[[") || /^\[=+\[/.test(raw))
+        return raw.replace(/^\[=*\[/, "").replace(/\]=*\]$/, "");
+    const q = raw[0];
+    if (q !== '"' && q !== "'") return raw;
+    const inner = raw.slice(1,-1);
+    let result = "", i = 0;
+    while (i < inner.length) {
+        if (inner[i] === "\\" && i+1 < inner.length) {
+            const nx = inner[i+1];
+            if      (nx === "n")  { result += "\n"; i+=2; }
+            else if (nx === "t")  { result += "\t"; i+=2; }
+            else if (nx === "r")  { result += "\r"; i+=2; }
+            else if (nx === "\\") { result += "\\"; i+=2; }
+            else if (nx === '"')  { result += '"';  i+=2; }
+            else if (nx === "'")  { result += "'";  i+=2; }
+            else if (nx === "a")  { result += "\x07"; i+=2; }
+            else if (nx === "b")  { result += "\x08"; i+=2; }
+            else if (nx === "f")  { result += "\x0C"; i+=2; }
+            else if (nx === "v")  { result += "\x0B"; i+=2; }
+            else if (/\d/.test(nx)) {
+                let ns = "", j = i+1;
+                while (j < inner.length && /\d/.test(inner[j]) && ns.length < 3) { ns += inner[j]; j++; }
+                result += String.fromCharCode(parseInt(ns)); i = j;
+            } else { result += nx; i+=2; }
+        } else { result += inner[i]; i++; }
+    }
+    return result;
+}
+
+function eNum(n) {
+    if (!Number.isInteger(n)||n<0||n>0xFFFFFF) return String(n);
+    if (n===0) return "0";
+    const k=(Math.floor(Math.random()*252)+2)&0xFF;
+    return `(bit32.bxor(${(n^k)&0xFFFFFF},${k}))`;
+}
+function eStr(raw, decFn) {
+    if (!raw) return '""';
+    const str = rawToStr(raw);
+    if (!str) return '""';
+    const bytes = Array.from(Buffer.from(str,"utf8"));
+    if (!bytes.length) return '""';
+    const key = (Math.floor(Math.random()*252)+2)&0xFF;
+    const enc = bytes.map(b=>(b^key)&0xFF);
+    return `${decFn}({${enc.join(",")}},${key})`;
+}
+function eBool(v) {
+    const k = Math.floor(Math.random()*200)+10;
+    return v ? `(bit32.bxor(${k},${k})==0)` : `(bit32.bxor(${k},${k})~=0)`;
+}
+
+const LUA_KW = new Set(["and","break","do","else","elseif","end","false","for",
+    "function","goto","if","in","local","nil","not","or","repeat","return",
+    "then","true","until","while","self","_ENV"]);
+
+function emitAST(node, ctx) {
+    if (!node) return "nil";
+    const R = v => emitAST(v, ctx);
+    const L = a => a.map(v=>emitAST(v,ctx)).join(",");
+    const B = a => a.map(R).join("\n");
+    switch (node.type) {
+        case "Chunk": return B(node.body);
+        case "LocalStatement": return "local "+node.variables.map(R).join(",")+(node.init.length?"="+L(node.init):"");
+        case "AssignmentStatement": return L(node.variables)+"="+L(node.init);
+        case "ReturnStatement": { const a=L(node.arguments); return "return"+(a?" "+a:""); }
+        case "BreakStatement": return "break";
+        case "DoStatement": return "do\n"+B(node.body)+"\nend";
+        case "WhileStatement": return "while("+R(node.condition)+")do\n"+B(node.body)+"\nend";
+        case "RepeatStatement": return "repeat\n"+B(node.body)+"\nuntil("+R(node.condition)+")";
+        case "IfStatement": {
+            let s="if("+R(node.clauses[0].condition)+")then\n"+B(node.clauses[0].body);
+            for (let i=1;i<node.clauses.length;i++) {
+                const cl=node.clauses[i];
+                s+=cl.type==="ElseifClause"?"\nelseif("+R(cl.condition)+")then\n"+B(cl.body):"\nelse\n"+B(cl.body);
+            }
+            return s+"\nend";
+        }
+        case "ForNumericStatement": {
+            const v=ctx.v.get(node.variable.name)||node.variable.name;
+            return "for "+v+"="+R(node.start)+","+R(node.end)+(node.step?","+R(node.step):"")+" do\n"+B(node.body)+"\nend";
+        }
+        case "ForGenericStatement": {
+            const vars=node.variables.map(v=>ctx.v.get(v.name)||v.name).join(",");
+            return "for "+vars+" in "+L(node.iterators)+" do\n"+B(node.body)+"\nend";
+        }
+        case "FunctionDeclaration": {
+            const nm=R(node.identifier);
+            const ps=node.parameters.map(p=>p.type==="VarargLiteral"?"...":(ctx.v.get(p.name)||p.name)).join(",");
+            return (node.isLocal?"local function":"function")+" "+nm+"("+ps+")\n"+B(node.body)+"\nend";
+        }
+        case "FunctionExpression": {
+            const ps=node.parameters.map(p=>p.type==="VarargLiteral"?"...":(ctx.v.get(p.name)||p.name)).join(",");
+            return "function("+ps+")\n"+B(node.body)+"\nend";
+        }
+        case "CallStatement": return R(node.expression);
+        case "CallExpression": return R(node.base)+"("+L(node.arguments)+")";
+        case "StringCallExpression": return R(node.base)+"("+R(node.argument)+")";
+        case "TableCallExpression": return R(node.base)+"("+R(node.argument)+")";
+        case "MemberExpression": return R(node.base)+node.indexer+node.identifier.name;
+        case "IndexExpression": return R(node.base)+"["+R(node.index)+"]";
+        case "Identifier": return ctx.v.get(node.name)||node.name;
+        case "NumericLiteral": return eNum(node.value);
+        case "StringLiteral": return eStr(node.raw, ctx.df);
+        case "BooleanLiteral": return eBool(node.value);
+        case "NilLiteral": return "nil";
+        case "VarargLiteral": return "...";
+        case "UnaryExpression": return "("+node.operator+"("+R(node.argument)+"))";
+        case "BinaryExpression": return "("+R(node.left)+node.operator+R(node.right)+")";
+        case "LogicalExpression": return "("+R(node.left)+node.operator+R(node.right)+")";
+        case "TableConstructorExpression": {
+            const fields=node.fields.map(f=>{
+                if (f.type==="TableKey") return "["+R(f.key)+"]="+R(f.value);
+                if (f.type==="TableKeyString") return f.key.name+"="+R(f.value);
+                return R(f.value);
+            });
+            return "{"+fields.join(",")+"}";
+        }
+        default: return "--[[?"+node.type+"]]";
+    }
+}
+
+function gatherVars(nodes, map) {
+    if (!nodes) return;
+    for (const n of nodes) {
+        if (!n) continue;
+        if (n.type==="LocalStatement") n.variables.forEach(v=>{if(!LUA_KW.has(v.name))map.set(v.name,uid());});
+        if (n.type==="FunctionDeclaration") {
+            if (n.isLocal&&n.identifier) map.set(n.identifier.name,uid());
+            n.parameters.forEach(p=>{if(p.type==="Identifier"&&!LUA_KW.has(p.name))map.set(p.name,uid());});
+            gatherVars(n.body,map);
+        }
+        if (n.type==="FunctionExpression") { n.parameters.forEach(p=>{if(p.type==="Identifier"&&!LUA_KW.has(p.name))map.set(p.name,uid());}); gatherVars(n.body,map); }
+        if (n.type==="ForNumericStatement") { map.set(n.variable.name,uid()); gatherVars(n.body,map); }
+        if (n.type==="ForGenericStatement") { n.variables.forEach(v=>{if(!LUA_KW.has(v.name))map.set(v.name,uid());}); gatherVars(n.body,map); }
+        if (n.body&&Array.isArray(n.body)) gatherVars(n.body,map);
+        if (n.clauses) n.clauses.forEach(cl=>gatherVars(cl.body,map));
+    }
+}
+
+function obfuscateLuaSource(source) {
+    // Parse to AST - throws on syntax error
+    const ast = luaparse.parse(source, {luaVersion:"5.1"});
+    // Gather and rename all locals
+    const vmap = new Map();
+    gatherVars(ast.body, vmap);
+    // Unique decrypt function name for this upload
+    const decFn = uid(), decR = uid(), decI = uid();
+    const ctx = { v:vmap, df:decFn };
+    // Emit with all transformations
+    const code = emitAST(ast, ctx);
+    // Build decrypt function preamble
+    const decFunc = `local function ${decFn}(t,k)local ${decR}={}for ${decI}=1,#t do ${decR}[${decI}]=string.char(bit32.bxor(t[${decI}],k))end;return table.concat(${decR})end`;
+    // Junk variables
+    const jv = Array.from({length:4},()=>{
+        const n=uid(),v=(Math.floor(Math.random()*200)+10),k=(Math.floor(Math.random()*100)+1);
+        return `local ${n}=bit32.bxor(${(v^k)&0xFF},${k})`;
+    }).join("\n");
+    return `${decFunc}
+${jv}
+${code}`;
+}
+
+// -----------------------------------------------------------------------------
+// LAYER 2+: XOR ENCRYPTION + VM WRAPPER
+// -----------------------------------------------------------------------------
 function buildEncryptedScript(source, projectId) {
+    // Layer 1: obfuscate at source level first
+    let obfSource;
+    try {
+        obfSource = obfuscateLuaSource(source);
+    } catch(e) {
+        // If parse fails (e.g. non-standard syntax), fall back to raw source
+        console.warn("[Obf] Parse failed, using raw source:", e.message);
+        obfSource = source;
+    }
+
     const projKey = deriveKey(projectId);
     const sk1=Array.from(crypto.randomBytes(8));
     const sk2=Array.from(crypto.randomBytes(8));
     const sk3=Array.from(crypto.randomBytes(8));
     const sk4=Array.from(crypto.randomBytes(8));
-    const srcBytes=Array.from(Buffer.from(source,"utf8"));
+
+    // Anti-tamper checksum of the obfuscated source
+    const srcBytes=Array.from(Buffer.from(obfSource,"utf8"));
     const srcChecksum=srcBytes.reduce((s,b)=>(s+b)&0xFF,0);
 
     // RC4 sbox keyed to project
     const sbox=Array.from({length:256},(_,i)=>i);
     let jj=0;
-    for(let i=0;i<256;i++){
-        jj=(jj+sbox[i]+projKey[i%32])&0xFF;
-        [sbox[i],sbox[jj]]=[sbox[jj],sbox[i]];
-    }
+    for(let i=0;i<256;i++){jj=(jj+sbox[i]+projKey[i%32])&0xFF;[sbox[i],sbox[jj]]=[sbox[jj],sbox[i]];}
     const isbox=new Array(256);
     for(let i=0;i<256;i++) isbox[sbox[i]]=i;
 
-    // 5-pass encode
-    const enc=Array.from(Buffer.from(source,"utf8")).map((byte,idx)=>{
+    // 5-pass XOR encode of obfuscated source
+    const enc=Array.from(Buffer.from(obfSource,"utf8")).map((byte,idx)=>{
         let b=sbox[byte&0xFF];
         b=(b^sk1[idx%8]^(idx&0xFF))&0xFF;
         b=(b^sk2[(idx*3)%8])&0xFF;
@@ -95,56 +284,14 @@ function buildEncryptedScript(source, projectId) {
     const chunks=[];
     for(let i=0;i<b64.length;i+=80) chunks.push(JSON.stringify(b64.slice(i,i+80)));
 
-    // Generate 40 unique variable names — enough for everything
-    const vars = Array.from({length:40}, uid);
-    const [
-        vST,   // state machine counter
-        vB64,  // base64 alphabet string
-        vMAP,  // base64 decode map table
-        vDEC,  // decode function name
-        vSTR,  // decode function param (string input)
-        vOUT,  // decode function output table
-        vLI,   // decode loop index (LOCAL inside function)
-        vPA,   // b64 nibble a
-        vPB,   // b64 nibble b
-        vPC,   // b64 nibble c
-        vPD,   // b64 nibble d
-        vNUM,  // combined b64 number
-        vSK1,  // session key 1
-        vSK2,  // session key 2
-        vSK3,  // session key 3
-        vSK4,  // session key 4
-        vISB,  // inverse sbox
-        vCHK,  // chunks table
-        vRES,  // decoded bytes array (output of vDEC)
-        vRAW,  // decrypted chars array
-        vBI,   // byte loop index (state 3 loop var, LOCAL)
-        vBYT,  // current byte being decrypted
-        vFN,   // loadstring result function
-        vERR,  // loadstring error
-        vCSM,  // checksum accumulator
-        vCSI,  // checksum loop index (LOCAL)
-        vDBG,  // debug library ref
-        vHOK,  // hook detected bool
-        vGPC,  // pcall result
-        vGLI,  // anti-debug busy loop counter
-        vMAI,  // base64 map build loop index (state 1, LOCAL)
-    ] = vars;
+    // 31 unique variable names for the VM wrapper
+    const vars=Array.from({length:31},uid);
+    const [vST,vB64,vMAP,vDEC,vSTR,vOUT,vLI,vPA,vPB,vPC,vPD,vNUM,
+           vSK1,vSK2,vSK3,vSK4,vISB,vCHK,vRES,vRAW,vBI,vBYT,vFN,vERR,
+           vCSM,vHOK,vGLI,vCSI,vMAI]=vars;
 
-    const SK1=`{${sk1.join(",")}}`;
-    const SK2=`{${sk2.join(",")}}`;
-    const SK3=`{${sk3.join(",")}}`;
-    const SK4=`{${sk4.join(",")}}`;
-    const ISBOX=`{${isbox.join(",")}}`;
-    const CHUNKS=`{${chunks.join(",")}}`;
-    const HASH=String(srcChecksum);
     const TAG=crypto.randomBytes(4).toString("hex").toUpperCase();
 
-    // Key rules for valid Lua:
-    // 1. Every variable used must be declared before use
-    // 2. for loop vars are implicitly local in Lua — never pre-declare them
-    // 3. Local function inside elseif is fine but captures outer-scope vars
-    // 4. No variable name conflicts between scopes
     return `--[[ Lunex VM ${TAG} ]]
 local ${vST}=1
 local ${vB64},${vMAP},${vDEC}
@@ -155,11 +302,11 @@ local ${vCSM},${vHOK},${vGLI}
 local ${vBYT}
 while ${vST}>0 do
   if ${vST}==1 then
-    ${vSK1}=${SK1}
-    ${vSK2}=${SK2}
-    ${vSK3}=${SK3}
-    ${vSK4}=${SK4}
-    ${vISB}=${ISBOX}
+    ${vSK1}={${sk1.join(",")}}
+    ${vSK2}={${sk2.join(",")}}
+    ${vSK3}={${sk3.join(",")}}
+    ${vSK4}={${sk4.join(",")}}
+    ${vISB}={${isbox.join(",")}}
     ${vB64}="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     ${vMAP}={}
     for ${vMAI}=0,63 do
@@ -177,16 +324,12 @@ while ${vST}>0 do
         local ${vPD}=${vMAP}[${vSTR}:sub(${vLI}+3,${vLI}+3)]or 0
         local ${vNUM}=${vPA}*262144+${vPB}*4096+${vPC}*64+${vPD}
         ${vOUT}[#${vOUT}+1]=math.floor(${vNUM}/65536)%256
-        if ${vSTR}:sub(${vLI}+2,${vLI}+2)~="=" then
-          ${vOUT}[#${vOUT}+1]=math.floor(${vNUM}/256)%256
-        end
-        if ${vSTR}:sub(${vLI}+3,${vLI}+3)~="=" then
-          ${vOUT}[#${vOUT}+1]=${vNUM}%256
-        end
+        if ${vSTR}:sub(${vLI}+2,${vLI}+2)~="=" then ${vOUT}[#${vOUT}+1]=math.floor(${vNUM}/256)%256 end
+        if ${vSTR}:sub(${vLI}+3,${vLI}+3)~="=" then ${vOUT}[#${vOUT}+1]=${vNUM}%256 end
       end
       return ${vOUT}
     end
-    ${vCHK}=${CHUNKS}
+    ${vCHK}={${chunks.join(",")}}
     ${vRES}=${vDEC}(table.concat(${vCHK}))
     ${vST}=3
   elseif ${vST}==3 then
@@ -207,7 +350,7 @@ while ${vST}>0 do
     for ${vCSI}=1,#${vRAW} do
       ${vCSM}=bit32.band(${vCSM}+string.byte(${vRAW}[${vCSI}]),255)
     end
-    if ${vCSM}~=${HASH} then
+    if ${vCSM}~=${srcChecksum} then
       while true do end
     end
     ${vST}=5
@@ -218,10 +361,7 @@ while ${vST}>0 do
     end
     if ${vHOK} then
       ${vGLI}=0
-      while true do
-        ${vGLI}=${vGLI}+1
-        if ${vGLI}>1e8 then break end
-      end
+      while true do ${vGLI}=${vGLI}+1 if ${vGLI}>1e8 then break end end
       return
     end
     ${vST}=6
@@ -236,7 +376,7 @@ while ${vST}>0 do
 end`;
 }
 
-// ── Generators ────────────────────────────────────────────────────────────────
+// -- Generators ----------------------------------------------------------------
 function genKey(prefix="LUNEX") {
     const s=()=>crypto.randomBytes(3).toString("hex").toUpperCase();
     return `${prefix}-${s()}-${s()}-${s()}`;
@@ -244,7 +384,7 @@ function genKey(prefix="LUNEX") {
 function genApiKey() { return crypto.randomBytes(32).toString("hex"); }
 function san(s,max=500) { return typeof s==="string"?s.slice(0,max).replace(/[<>]/g,""):""; }
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// -- Auth middleware -----------------------------------------------------------
 async function auth(req, res, next) {
     try {
         const raw = (req.headers["authorization"]||"").replace(/^Bearer\s+/i,"").trim() || req.headers["x-api-key"]||"";
@@ -270,18 +410,18 @@ function wrap(fn) {
     };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SCRIPT AUTH — two-step token system
+// -----------------------------------------------------------------------------
+// SCRIPT AUTH - two-step token system
 //
 // Step 1: GET /v1/auth?key=LUNEX-XXX&hwid=HWID_HASH
-//   → validates key, locks HWID, returns signed 30-second token
+//   -> validates key, locks HWID, returns signed 30-second token
 // Step 2: GET /v1/run?t=TOKEN
-//   → verifies token signature + expiry, returns encrypted script
-//   → token is single-use and deleted after use
+//   -> verifies token signature + expiry, returns encrypted script
+//   -> token is single-use and deleted after use
 //
 // Loader: loadstring(game:HttpGet(BASE/v1/auth?key=KEY_HERE&hwid=HWID))()
-// The /v1/run URL never contains the user's key — only a 30s random token
-// ─────────────────────────────────────────────────────────────────────────────
+// The /v1/run URL never contains the user's key - only a 30s random token
+// -----------------------------------------------------------------------------
 
 // Sign a token: base64url(json) + "." + HMAC-SHA256 signature
 function signToken(payload) {
@@ -302,14 +442,14 @@ function verifyToken(token) {
     } catch { return null; }
 }
 
-// Step 1 — validate key, lock HWID, issue 30s token
+// Step 1 - validate key, lock HWID, issue 30s token
 app.get("/v1/auth", authL, wrap(async(req,res)=>{
     const userKey = san(String(req.query.key||""),100);
     const hwid    = san(String(req.query.hwid||""),200);
     const fail    = msg => res.set("Content-Type","text/plain").send(`error("Lunex: ${msg}")`);
 
     if (!userKey) return fail("Missing key");
-    // hwid is optional — we use it if provided, skip if not (FFA scripts)
+    // hwid is optional - we use it if provided, skip if not (FFA scripts)
 
     // Cache: same key+hwid gets same token for 25s (avoids hammering DB on retry)
     const cacheKey = `tok:${userKey}:${hwid}`;
@@ -321,7 +461,7 @@ app.get("/v1/auth", authL, wrap(async(req,res)=>{
         .eq("key_string",userKey).single();
 
     if (rowErr||!row)  return fail("Invalid key");
-    if (!row.active)   return fail("Key revoked — contact support");
+    if (!row.active)   return fail("Key revoked - contact support");
     if (row.expires_at&&Math.floor(Date.now()/1000)>row.expires_at) return fail("Key expired");
 
     // HWID lock
@@ -335,9 +475,9 @@ app.get("/v1/auth", authL, wrap(async(req,res)=>{
                 ...(exp?{expires_at:exp}:{})
             }).eq("id",row.id);
         } else if (row.hwid!==hwid) {
-            return fail("HWID mismatch — run /resethwid in Discord to switch devices");
+            return fail("HWID mismatch - run /resethwid in Discord to switch devices");
         } else {
-            // Fire-and-forget exec count update (don't await — faster response)
+            // Fire-and-forget exec count update (don't await - faster response)
             sb.from("keys").update({
                 total_executions:(row.total_executions||0)+1,
                 last_exec:new Date().toISOString()
@@ -350,7 +490,7 @@ app.get("/v1/auth", authL, wrap(async(req,res)=>{
         pid: row.project_id,
         kid: row.id,
         exp: Math.floor(Date.now()/1000)+30,
-        r:   crypto.randomBytes(4).toString("hex") // nonce — prevents replay
+        r:   crypto.randomBytes(4).toString("hex") // nonce - prevents replay
     });
 
     // Return a tiny Lua snippet that immediately fetches and runs the script
@@ -364,16 +504,16 @@ app.get("/v1/auth", authL, wrap(async(req,res)=>{
     res.set("Content-Type","text/plain").send(snippet);
 }));
 
-// Step 2 — verify token, return encrypted script
+// Step 2 - verify token, return encrypted script
 app.get("/v1/run", authL, wrap(async(req,res)=>{
     const fail = msg => res.set("Content-Type","text/plain").send(`error("Lunex: ${msg}")`);
     const t    = san(String(req.query.t||""),512);
     if (!t) return fail("Missing token");
 
     const payload = verifyToken(t);
-    if (!payload)  return fail("Invalid or expired token — re-run the loader");
+    if (!payload)  return fail("Invalid or expired token - re-run the loader");
 
-    // Cache the script by project_id for 15s — fast for 50 concurrent users
+    // Cache the script by project_id for 15s - fast for 50 concurrent users
     const cacheKey = `script:${payload.pid}`;
     const cached   = cacheGet(cacheKey);
     if (cached) return res.set("Content-Type","text/plain").send(cached);
@@ -390,15 +530,15 @@ app.get("/v1/run", authL, wrap(async(req,res)=>{
     res.set("Content-Type","text/plain").send(proj.obfuscated_script);
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // ACCOUNT
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 app.get("/v1/account", apiL, auth, wrap(async(req,res)=>{
     const {data} = await sb.from("owners").select("email,plan,created_at,expires_at,obfs_used").eq("id",req.owner.id).single();
     res.json({success:true, account:data||req.owner});
 }));
 
-// Create owner account (you) — protected by admin_secret
+// Create owner account (you) - protected by admin_secret
 app.post("/v1/admin/owners", adminL, wrap(async(req,res)=>{
     if (!req.body||req.body.admin_secret!==process.env.ADMIN_SECRET)
         return res.status(403).json({error:"Forbidden"});
@@ -413,9 +553,9 @@ app.post("/v1/admin/owners", adminL, wrap(async(req,res)=>{
     res.json({success:true,api_key:apiKey,owner:data});
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // PROJECTS
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 app.get("/v1/projects", apiL, auth, wrap(async(req,res)=>{
     const hit = cacheGet("projs:"+req.owner.id);
     if (hit) return res.json({success:true,projects:hit});
@@ -479,9 +619,9 @@ app.post("/v1/projects/:id/toggle", apiL, auth, wrap(async(req,res)=>{
     res.json({success:true,active:!p.active});
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // KEYS
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 app.get("/v1/projects/:id/keys", apiL, auth, wrap(async(req,res)=>{
     const page  = Math.max(1,parseInt(req.query.page)||1);
     const limit = Math.min(200,parseInt(req.query.limit)||100);
@@ -537,9 +677,9 @@ app.post("/v1/keys/:key/extend", apiL, auth, wrap(async(req,res)=>{
     res.json({success:true,new_expiry:base+days*86400});
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // STATS
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 app.get("/v1/stats", apiL, auth, wrap(async(req,res)=>{
     const hit=cacheGet("stats:"+req.owner.id);
     if (hit) return res.json(hit);
@@ -559,9 +699,9 @@ app.get("/v1/stats", apiL, auth, wrap(async(req,res)=>{
     res.json(r);
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// INTERNAL — Discord bot endpoints
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// INTERNAL - Discord bot endpoints
+// -----------------------------------------------------------------------------
 function chkInt(req,res){
     const s=req.body?.secret||req.query?.secret;
     if (!s||s!==process.env.MASTER_SECRET){res.status(403).json({error:"Forbidden"});return false;}
@@ -602,9 +742,9 @@ app.get("/internal/keyinfo",wrap(async(req,res)=>{
     res.json({success:true,keys:data||[]});
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // CRON
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 cron.schedule("*/5 * * * *",async()=>{
     await sb.from("keys").update({active:false}).lt("expires_at",Math.floor(Date.now()/1000)).eq("active",true).not("expires_at","is",null);
     cacheDel("auth:","stats:");
@@ -616,10 +756,10 @@ cron.schedule("0 0 1 * *",async()=>{
 });
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PAYMENTS — NOWPayments crypto checkout
+// -----------------------------------------------------------------------------
+// PAYMENTS - NOWPayments crypto checkout
 // Waits for blockchain confirmation before creating account
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 const NOW_API  = process.env.NOWPAYMENTS_API_KEY  || "";
 const NOW_IPN  = process.env.NOWPAYMENTS_IPN_KEY  || "";
 const SITE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -636,7 +776,7 @@ const COUPONS = {
     "FREE99": { discount:100, type:"percent" }, // 100% off
 };
 
-// Create a payment — returns NOWPayments invoice URL
+// Create a payment - returns NOWPayments invoice URL
 app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
     const plan   = req.body.plan;
     const email  = san(req.body.email||"",200);
@@ -664,7 +804,7 @@ app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
         couponApplied = true;
     }
 
-    // If 100% off — create account immediately, no payment needed
+    // If 100% off - create account immediately, no payment needed
     if (price <= 0) {
         const apiKey = genApiKey();
         const exp = Math.floor(Date.now()/1000) + p.days*86400;
@@ -672,7 +812,7 @@ app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
             email, api_key:apiKey, plan, expires_at:exp, obfs_used:0
         }).select("id,email,plan").single();
         if (error) return res.status(500).json({error:error.message});
-        return res.json({success:true, free:true, api_key:apiKey, plan:p.name, message:"Account created — save your API key!"});
+        return res.json({success:true, free:true, api_key:apiKey, plan:p.name, message:"Account created - save your API key!"});
     }
 
     // Create NOWPayments invoice
@@ -684,7 +824,7 @@ app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
                 price_amount: price,
                 price_currency: "usd",
                 order_id: `lunex_${plan}_${Date.now()}`,
-                order_description: `Lunex ${p.name} — 30 days`,
+                order_description: `Lunex ${p.name} - 30 days`,
                 ipn_callback_url: `${SITE_URL}/v1/payments/webhook`,
                 success_url: `${SITE_URL}/payment-success?email=${encodeURIComponent(email)}&plan=${plan}`,
                 cancel_url:  `${SITE_URL}/pricing`,
@@ -713,7 +853,7 @@ app.post("/v1/payments/create", apiL, wrap(async(req,res)=>{
     }
 }));
 
-// NOWPayments IPN webhook — called when payment is confirmed on blockchain
+// NOWPayments IPN webhook - called when payment is confirmed on blockchain
 app.post("/v1/payments/webhook", express.json(), wrap(async(req,res)=>{
     // Verify IPN signature
     const sig  = req.headers["x-nowpayments-sig"]||"";
@@ -743,7 +883,7 @@ app.post("/v1/payments/webhook", express.json(), wrap(async(req,res)=>{
     }
     if (pmt.status==="completed") {
         console.log("[Pay] Already processed:", order_id);
-        return res.status(200).json({ok:true}); // idempotent — safe to receive twice
+        return res.status(200).json({ok:true}); // idempotent - safe to receive twice
     }
     // Double-spend guard: mark as processing first (atomic)
     const {data:locked} = await sb.from("pending_payments")
@@ -772,11 +912,11 @@ app.post("/v1/payments/webhook", express.json(), wrap(async(req,res)=>{
     res.status(200).json({ok:true});
 }));
 
-// Check payment status — frontend polls this
+// Check payment status - frontend polls this
 app.get("/v1/payments/status/:invoiceId", apiL, wrap(async(req,res)=>{
     const {data} = await sb.from("pending_payments").select("status,api_key,plan,email").eq("invoice_id",req.params.invoiceId).single();
     if (!data) return res.status(404).json({error:"Payment not found"});
-    // Never send api_key if payment failed or is pending — only on completed
+    // Never send api_key if payment failed or is pending - only on completed
     res.json({
         success:true,
         status:data.status,
@@ -805,14 +945,14 @@ app.post("/v1/coupons/validate", apiL, wrap(async(req,res)=>{
     res.json({valid:true, discount:c.discount, type:c.type, final_price:final, free:final<=0});
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // SERVE DASHBOARD
-// ─────────────────────────────────────────────────────────────────────────────
-// Route table — clean and intentional
-// /          → homepage (home.html)
-// /login     → dashboard (index.html)
-// /pricing   → pricing page
-// /payment-success → payment confirmation
+// -----------------------------------------------------------------------------
+// Route table - clean and intentional
+// /          -> homepage (home.html)
+// /login     -> dashboard (index.html)
+// /pricing   -> pricing page
+// /payment-success -> payment confirmation
 const sf = (file,res) => res.sendFile(path.join(__dirname,"dashboard",file), err=>{
     if(err) res.status(404).send("Page not found");
 });
