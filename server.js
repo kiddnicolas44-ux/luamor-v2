@@ -151,7 +151,7 @@ local ${vB64},${vMAP},${vDEC}
 local ${vSK1},${vSK2},${vSK3},${vSK4},${vISB}
 local ${vCHK},${vRES},${vRAW}
 local ${vFN},${vERR}
-local ${vCSM},${vDBG},${vHOK},${vGPC},${vGLI}
+local ${vCSM},${vHOK},${vGLI}
 local ${vBYT}
 while ${vST}>0 do
   if ${vST}==1 then
@@ -212,13 +212,9 @@ while ${vST}>0 do
     end
     ${vST}=5
   elseif ${vST}==5 then
-    ${vDBG}=debug
     ${vHOK}=false
-    if ${vDBG} and ${vDBG}.getinfo then
-      ${vGPC}=pcall(function()
-        ${vDBG}.getinfo(1)
-      end)
-      if ${vGPC} then ${vHOK}=true end
+    if hookfunction~=nil or getupvalues~=nil or getgc~=nil then
+      ${vHOK}=true
     end
     if ${vHOK} then
       ${vGLI}=0
