@@ -462,6 +462,15 @@ app.post("/v1/projects/:id/script", apiL, auth, wrap(async(req,res)=>{
     res.json({success:true,version:ver,loader});
 }));
 
+app.get("/v1/projects/:id/script-raw", apiL, auth, wrap(async(req,res)=>{
+    const {data:proj} = await sb.from("projects")
+        .select("obfuscated_script,script_version")
+        .eq("id",req.params.id).eq("owner_id",req.owner.id).single();
+    if (!proj) return res.status(404).json({error:"Project not found"});
+    if (!proj.obfuscated_script?.trim()) return res.status(404).json({error:"No script uploaded yet"});
+    res.set("Content-Type","text/plain").send(proj.obfuscated_script);
+}));
+
 app.post("/v1/projects/:id/toggle", apiL, auth, wrap(async(req,res)=>{
     const {data:p} = await sb.from("projects").select("active").eq("id",req.params.id).eq("owner_id",req.owner.id).single();
     if (!p) return res.status(404).json({error:"Not found"});
