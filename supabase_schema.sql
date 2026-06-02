@@ -1,8 +1,6 @@
--- ═══════════════════════════════════════════════════════
--- LUNEX WHITELIST — Full Schema (run this in Supabase SQL Editor)
--- ═══════════════════════════════════════════════════════
+-- Run this in your Supabase SQL editor
 
--- OWNERS (one per seller/developer)
+-- OWNERS
 create table if not exists owners (
   id             uuid primary key default gen_random_uuid(),
   email          text unique not null,
@@ -14,7 +12,7 @@ create table if not exists owners (
   expires_at     bigint
 );
 
--- PROJECTS (each owner can have multiple scripts)
+-- PROJECTS
 create table if not exists projects (
   id                 uuid primary key default gen_random_uuid(),
   owner_id           uuid references owners(id) on delete cascade,
@@ -28,7 +26,7 @@ create table if not exists projects (
   updated_at         timestamptz default now()
 );
 
--- KEYS (one per whitelisted user)
+-- KEYS
 create table if not exists keys (
   id                uuid primary key default gen_random_uuid(),
   project_id        uuid references projects(id) on delete cascade,
@@ -46,11 +44,11 @@ create table if not exists keys (
   updated_at        timestamptz default now()
 );
 
--- BOT CONFIGS (one per Discord server — supports multiple guilds/owners)
+-- BOT CONFIGS
 create table if not exists bot_configs (
   guild_id            text primary key,
   api_key             text,
-  project_id          text,
+  project_id          uuid,
   project_name        text,
   buyer_role_id       text,
   manager_role_id     text,
@@ -67,28 +65,15 @@ create index if not exists idx_keys_project_id   on keys(project_id);
 create index if not exists idx_keys_active        on keys(active);
 create index if not exists idx_projects_owner_id  on projects(owner_id);
 
--- Disable RLS (we use service role key which bypasses RLS anyway)
+-- Disable RLS for service role (Supabase default)
 alter table owners      disable row level security;
 alter table projects    disable row level security;
 alter table keys        disable row level security;
 alter table bot_configs disable row level security;
 
--- Fix existing bot_configs table if it has uuid type for project_id
-alter table bot_configs alter column project_id type text;
+-- ── CREATE YOUR FIRST OWNER ACCOUNT ──────────────────────────────────────────
+-- Replace the values below with your real email and a strong random API key
+-- Then login to the dashboard at https://your-app.up.railway.app
 
--- PENDING PAYMENTS (crypto checkout)
-create table if not exists pending_payments (
-  id           uuid primary key default gen_random_uuid(),
-  invoice_id   text unique,
-  order_id     text unique,
-  email        text not null,
-  plan         text not null,
-  price        numeric,
-  status       text default 'pending',
-  api_key      text,
-  completed_at timestamptz,
-  created_at   timestamptz default now()
-);
-alter table pending_payments disable row level security;
-create index if not exists idx_payments_order on pending_payments(order_id);
-create index if not exists idx_payments_invoice on pending_payments(invoice_id);
+-- insert into owners (email, api_key, plan)
+-- values ('you@email.com', 'your-64-char-api-key-here', 'elite');
