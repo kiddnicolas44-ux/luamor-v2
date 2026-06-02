@@ -1,9 +1,11 @@
 {
-  "name": "lunex-whitelist",
+  "name": "whitelist-service",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "bot": "node bot.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
@@ -12,10 +14,9 @@
     "dotenv": "^16.4.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
+    "multer": "^1.4.5-lts.1",
     "node-cron": "^3.0.3",
-    "luaparse": "^0.3.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "uuid": "^9.0.0",
+    "wasmoon": "^1.16.0"
   }
 }
