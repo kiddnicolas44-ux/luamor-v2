@@ -68,13 +68,10 @@ function buildEncryptedScript(source, projectId) {
     const sk2=Array.from(crypto.randomBytes(8));
     const sk3=Array.from(crypto.randomBytes(8));
     const sk4=Array.from(crypto.randomBytes(8));
+    const srcBytes=Array.from(Buffer.from(source,"utf8"));
+    const srcChecksum=srcBytes.reduce((s,b)=>(s+b)&0xFF,0);
 
-    // Anti-tamper: simple byte-sum checksum of source mod 256
-    // Lua verifies this at runtime — if any byte changed, sum won't match
-    const srcBytes = Array.from(Buffer.from(source,"utf8"));
-    const srcChecksum = srcBytes.reduce((s,b)=>(s+b)&0xFF, 0);
-
-    // RC4-style substitution box keyed to this project
+    // RC4 sbox keyed to project
     const sbox=Array.from({length:256},(_,i)=>i);
     let jj=0;
     for(let i=0;i<256;i++){
@@ -84,13 +81,13 @@ function buildEncryptedScript(source, projectId) {
     const isbox=new Array(256);
     for(let i=0;i<256;i++) isbox[sbox[i]]=i;
 
-    // 5-pass encode (decode is exact reverse in Lua)
-    const enc=Array.from(Buffer.from(source,"utf8")).map((byte,i)=>{
+    // 5-pass encode
+    const enc=Array.from(Buffer.from(source,"utf8")).map((byte,idx)=>{
         let b=sbox[byte&0xFF];
-        b=(b^sk1[i%8]^(i&0xFF))&0xFF;
-        b=(b^sk2[(i*3)%8])&0xFF;
-        b=(b^sk3[i%8])&0xFF;
-        b=(b^sk4[(i+1)%8])&0xFF;
+        b=(b^sk1[idx%8]^(idx&0xFF))&0xFF;
+        b=(b^sk2[(idx*3)%8])&0xFF;
+        b=(b^sk3[idx%8])&0xFF;
+        b=(b^sk4[(idx+1)%8])&0xFF;
         return b;
     });
 
@@ -98,99 +95,143 @@ function buildEncryptedScript(source, projectId) {
     const chunks=[];
     for(let i=0;i<b64.length;i+=80) chunks.push(JSON.stringify(b64.slice(i,i+80)));
 
-    // 23 unique variable names — all randomised per upload
-    const [vB,vM,vD,vS,vR,vI,vP,vQ,vVR,vVS,vN,
-           vK1,vK2,vK3,vK4,vIB,vCH,vBS,vBY,vCI,vFN,vER,vRW,
-           vST,vHASH,vHV,vAD,vDBG,vHK,vGU,vGC,vDISP,vSTEP]=
-        Array.from({length:33},uid);
+    // Generate 40 unique variable names — enough for everything
+    const vars = Array.from({length:40}, uid);
+    const [
+        vST,   // state machine counter
+        vB64,  // base64 alphabet string
+        vMAP,  // base64 decode map table
+        vDEC,  // decode function name
+        vSTR,  // decode function param (string input)
+        vOUT,  // decode function output table
+        vLI,   // decode loop index (LOCAL inside function)
+        vPA,   // b64 nibble a
+        vPB,   // b64 nibble b
+        vPC,   // b64 nibble c
+        vPD,   // b64 nibble d
+        vNUM,  // combined b64 number
+        vSK1,  // session key 1
+        vSK2,  // session key 2
+        vSK3,  // session key 3
+        vSK4,  // session key 4
+        vISB,  // inverse sbox
+        vCHK,  // chunks table
+        vRES,  // decoded bytes array (output of vDEC)
+        vRAW,  // decrypted chars array
+        vBI,   // byte loop index (state 3 loop var, LOCAL)
+        vBYT,  // current byte being decrypted
+        vFN,   // loadstring result function
+        vERR,  // loadstring error
+        vCSM,  // checksum accumulator
+        vCSI,  // checksum loop index (LOCAL)
+        vDBG,  // debug library ref
+        vHOK,  // hook detected bool
+        vGPC,  // pcall result
+        vGLI,  // anti-debug busy loop counter
+        vMAI,  // base64 map build loop index (state 1, LOCAL)
+    ] = vars;
 
-    const HASH_LIT = String(srcChecksum);
     const SK1=`{${sk1.join(",")}}`;
     const SK2=`{${sk2.join(",")}}`;
     const SK3=`{${sk3.join(",")}}`;
     const SK4=`{${sk4.join(",")}}`;
     const ISBOX=`{${isbox.join(",")}}`;
     const CHUNKS=`{${chunks.join(",")}}`;
+    const HASH=String(srcChecksum);
     const TAG=crypto.randomBytes(4).toString("hex").toUpperCase();
 
-    // State machine steps for control flow flattening
-    // Steps: 1=init keys, 2=decode b64, 3=decrypt, 4=verify hash, 5=anti-debug, 6=execute
+    // Key rules for valid Lua:
+    // 1. Every variable used must be declared before use
+    // 2. for loop vars are implicitly local in Lua — never pre-declare them
+    // 3. Local function inside elseif is fine but captures outer-scope vars
+    // 4. No variable name conflicts between scopes
     return `--[[ Lunex VM ${TAG} ]]
 local ${vST}=1
-local ${vB},${vM},${vD},${vS},${vR},${vI},${vP},${vQ},${vVR},${vVS},${vN}
-local ${vK1},${vK2},${vK3},${vK4},${vIB},${vCH},${vBS},${vBY},${vRW},${vFN},${vER}
-local ${vHASH},${vHV}
+local ${vB64},${vMAP},${vDEC}
+local ${vSK1},${vSK2},${vSK3},${vSK4},${vISB}
+local ${vCHK},${vRES},${vRAW}
+local ${vFN},${vERR}
+local ${vCSM},${vDBG},${vHOK},${vGPC},${vGLI}
+local ${vBYT}
 while ${vST}>0 do
   if ${vST}==1 then
-    ${vK1}=${SK1}
-    ${vK2}=${SK2}
-    ${vK3}=${SK3}
-    ${vK4}=${SK4}
-    ${vIB}=${ISBOX}
-    ${vHASH}=${HASH_LIT}
-    ${vB}="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    ${vM}={}
-    for ${vI}=0,63 do ${vM}[${vB}:sub(${vI}+1,${vI}+1)]=${vI} end
+    ${vSK1}=${SK1}
+    ${vSK2}=${SK2}
+    ${vSK3}=${SK3}
+    ${vSK4}=${SK4}
+    ${vISB}=${ISBOX}
+    ${vB64}="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    ${vMAP}={}
+    for ${vMAI}=0,63 do
+      ${vMAP}[${vB64}:sub(${vMAI}+1,${vMAI}+1)]=${vMAI}
+    end
     ${vST}=2
   elseif ${vST}==2 then
-    local function ${vD}(${vS})
-      ${vS}=${vS}:gsub("[^A-Za-z0-9+/=]","")
-      local ${vR}={}
-      for ${vI}=1,#${vS},4 do
-        local ${vP}=${vM}[${vS}:sub(${vI},${vI})]or 0
-        local ${vQ}=${vM}[${vS}:sub(${vI}+1,${vI}+1)]or 0
-        local ${vVR}=${vM}[${vS}:sub(${vI}+2,${vI}+2)]or 0
-        local ${vVS}=${vM}[${vS}:sub(${vI}+3,${vI}+3)]or 0
-        local ${vN}=${vP}*262144+${vQ}*4096+${vVR}*64+${vVS}
-        ${vR}[#${vR}+1]=math.floor(${vN}/65536)%256
-        if ${vS}:sub(${vI}+2,${vI}+2)~="=" then ${vR}[#${vR}+1]=math.floor(${vN}/256)%256 end
-        if ${vS}:sub(${vI}+3,${vI}+3)~="=" then ${vR}[#${vR}+1]=${vN}%256 end
+    ${vDEC}=function(${vSTR})
+      ${vSTR}=${vSTR}:gsub("[^A-Za-z0-9+/=]","")
+      local ${vOUT}={}
+      for ${vLI}=1,#${vSTR},4 do
+        local ${vPA}=${vMAP}[${vSTR}:sub(${vLI},${vLI})]or 0
+        local ${vPB}=${vMAP}[${vSTR}:sub(${vLI}+1,${vLI}+1)]or 0
+        local ${vPC}=${vMAP}[${vSTR}:sub(${vLI}+2,${vLI}+2)]or 0
+        local ${vPD}=${vMAP}[${vSTR}:sub(${vLI}+3,${vLI}+3)]or 0
+        local ${vNUM}=${vPA}*262144+${vPB}*4096+${vPC}*64+${vPD}
+        ${vOUT}[#${vOUT}+1]=math.floor(${vNUM}/65536)%256
+        if ${vSTR}:sub(${vLI}+2,${vLI}+2)~="=" then
+          ${vOUT}[#${vOUT}+1]=math.floor(${vNUM}/256)%256
+        end
+        if ${vSTR}:sub(${vLI}+3,${vLI}+3)~="=" then
+          ${vOUT}[#${vOUT}+1]=${vNUM}%256
+        end
       end
-      return ${vR}
+      return ${vOUT}
     end
-    ${vCH}=${CHUNKS}
-    ${vBS}=${vD}(table.concat(${vCH}))
+    ${vCHK}=${CHUNKS}
+    ${vRES}=${vDEC}(table.concat(${vCHK}))
     ${vST}=3
   elseif ${vST}==3 then
-    ${vRW}={}
-    for ${vCI}=1,#${vBS} do
-      ${vBY}=${vBS}[${vCI}]
-      ${vI}=${vCI}-1
-      ${vBY}=bit32.bxor(${vBY},${vK4}[(${vI}+1)%8+1])
-      ${vBY}=bit32.bxor(${vBY},${vK3}[${vI}%8+1])
-      ${vBY}=bit32.bxor(${vBY},${vK2}[(${vI}*3)%8+1])
-      ${vBY}=bit32.bxor(${vBY},${vI}%256)
-      ${vBY}=bit32.bxor(${vBY},${vK1}[${vI}%8+1])
-      ${vRW}[${vCI}]=string.char(${vIB}[${vBY}+1])
+    ${vRAW}={}
+    for ${vBI}=1,#${vRES} do
+      ${vBYT}=${vRES}[${vBI}]
+      local ${vLI}=${vBI}-1
+      ${vBYT}=bit32.bxor(${vBYT},${vSK4}[(${vLI}+1)%8+1])
+      ${vBYT}=bit32.bxor(${vBYT},${vSK3}[${vLI}%8+1])
+      ${vBYT}=bit32.bxor(${vBYT},${vSK2}[(${vLI}*3)%8+1])
+      ${vBYT}=bit32.bxor(${vBYT},${vLI}%256)
+      ${vBYT}=bit32.bxor(${vBYT},${vSK1}[${vLI}%8+1])
+      ${vRAW}[${vBI}]=string.char(${vISB}[${vBYT}+1])
     end
     ${vST}=4
   elseif ${vST}==4 then
-    local ${vAD}=0
-    for ${vCI}=1,#${vRW} do
-      ${vAD}=bit32.band(${vAD}+string.byte(${vRW}[${vCI}]),255)
+    ${vCSM}=0
+    for ${vCSI}=1,#${vRAW} do
+      ${vCSM}=bit32.band(${vCSM}+string.byte(${vRAW}[${vCSI}]),255)
     end
-    if ${vAD}~=${vHASH} then
+    if ${vCSM}~=${HASH} then
       while true do end
     end
     ${vST}=5
   elseif ${vST}==5 then
-    local ${vDBG}=debug
-    local ${vHK}=false
+    ${vDBG}=debug
+    ${vHOK}=false
     if ${vDBG} and ${vDBG}.getinfo then
-      local ${vGC}=pcall(function()
+      ${vGPC}=pcall(function()
         ${vDBG}.getinfo(1)
       end)
-      if ${vGC} then ${vHK}=true end
+      if ${vGPC} then ${vHOK}=true end
     end
-    if ${vHK} then
-      local ${vGU}=0
-      while true do ${vGU}=${vGU}+1 if ${vGU}>1e8 then break end end
+    if ${vHOK} then
+      ${vGLI}=0
+      while true do
+        ${vGLI}=${vGLI}+1
+        if ${vGLI}>1e8 then break end
+      end
       return
     end
     ${vST}=6
   elseif ${vST}==6 then
-    ${vFN},${vER}=loadstring(table.concat(${vRW}))
-    if not ${vFN} then error("Lunex: "..tostring(${vER})) end
+    ${vFN},${vERR}=loadstring(table.concat(${vRAW}))
+    if not ${vFN} then error("Lunex: "..tostring(${vERR})) end
     ${vFN}()
     ${vST}=0
   else
